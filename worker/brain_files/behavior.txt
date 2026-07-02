@@ -1,0 +1,61 @@
+1. ZERO TOLERANCE: HOSTILITY & ABUSE
+These are extreme violations of professional conduct and represent immediate failures.
+
+Direct Profanity & Slurs: Using explicit, offensive, abusive, or derogatory language directed at the customer, their family, or their situation (in any language).
+
+Character Attacks & Insults: Attacking the customer's intelligence, financial status, or medical condition (e.g., "If you don't care about your health, why did you call?" or "Are you not understanding simple English?").
+
+Aggressive Termination: Hanging up the phone forcefully or intentionally disconnecting the line while the customer is in the middle of speaking out of anger or frustration.
+
+2. VOCAL DYNAMICS & TONAL INTEGRITY
+These markers are identified via multimodal audio analysis to detect intent that words alone might hide.
+
+Vocal Brushing (Micro-Interruptions): Agent begins speaking while the customer is still in the middle of a sentence. This indicates a "waiting to speak" rather than a "listening to understand" mindset.
+
+The "Sigh" of Impatience: Any audible, heavy exhalation immediately following a customer’s query, objection, or slow response. This is a universal non-verbal marker of irritation.
+
+Monotone/Robotic Scripting: A complete lack of pitch variance, especially during "Empathy" or "Pitch" phases. It suggests the agent is disengaged and lacks belief in the service/cause.
+
+Condescending Enunciation: Slowing down speech excessively or over-emphasizing simple words as if treating the customer as intellectually inferior.
+
+Vocal Bullying: Increasing volume or sharpening the "edge" of the voice to force a customer into submission during a disagreement.
+
+3. LINGUISTIC & LANGUAGE RED FLAGS
+Language-specific triggers for English, Hindi, and Marathi that violate professional boundaries.
+
+Informal Pronoun Shift (Hindi/Marathi): Switching from formal pronouns (Hindi: Aap; Marathi: Bagha) to informal ones (Hindi: Tu/Tum; Marathi: Bagh) during high-friction moments.
+
+Inappropriate Familiarity: Using terms of endearment or casual slang (e.g., "Yaar," "Dude," "Bro") in a professional context.
+
+Filler Overload: Excessive use of "Um," "Uh," or "Like" that obscures the core message and projects extreme apathetic unprofessionalism. 
+
+4. ACCOUNTABILITY & DEFENSIVENESS
+How the agent handles friction, errors, or customer frustration.
+
+Blame-Shifting: Using language that places fault entirely on the customer or another department (e.g., "Well, you didn't read the email," or "That's IT's fault, not mine").
+
+Gaslighting / Minimizing: Telling the customer their valid concern is not a big deal or that they are overreacting (e.g., "It's just a small delay, I don't see why you are upset").
+
+Script Weaponization: Ignoring a customer’s mention of serious issues—such as prior bribery attempts, unauthorized charges, or medical malpractice—to continue with a scripted pitch.
+
+The "Quality" Retaliation: Any statement suggesting that the agent is only being polite because they are being monitored, or threatening to "check with Quality" to see if they can be rude back.
+
+5. ENVIRONMENTAL DISCONNECT (THE EMPATHY GAP)
+Contextual failures where the agent's surroundings contradict the professional intent.
+
+Locker-Room Floor Culture: Background audio containing laughter, joking, or cynical talk about other customers while a caller is describing a tragedy or crisis.
+
+Keyboard Clatter (Distracted Listening): Loud, aggressive typing detected while the customer is in a highly emotional state, signaling that the agent is multitasking or disengaged from the human element.
+
+Pre-Call/Post-Call Muttering: Use of profanity or disparaging remarks about the customer before the call connects or after the customer thinks the call has ended.
+
+SCORING LOGIC FOR "RESONANCE" ENGINE
+Parameter: Professional Behavior Maintained
+
+Mark NO if: Any marker from the categories above is detected.
+
+Reasoning Format: [Global Category]: {Specific behavioral trigger detected}.
+
+Example: "No - Zero Tolerance: Agent used direct profanity and disconnected the call at 04:12."
+
+Example: "No - Vocal Dynamics: Audible sigh and condescending enunciation detected at 03:15 when the customer asked for clarification."

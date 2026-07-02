@@ -1,0 +1,428 @@
+"""
+MetaGoHealth 1799 Sales Audit — Streamlit Community Cloud app.
+
+Teammate uploads the calls CSV, maps the columns once, clicks Run Audit,
+watches progress live. Runs with zero dependency on Mark.
+
+Pipeline per call:
+  1. Download MP3 from the recording URL
+  2. Check duration via ffprobe -> exclude if under 90 seconds
+  3. Gemini pass 1: verbatim transcript (speaker-labeled, timestamped)
+  4. Gemini pass 2: structured JSON scoring against the Legend rubric
+  5. Append one row to the Google Sheet
+
+Auth: service account JSON key stored in Streamlit secrets (GCP_SERVICE_ACCOUNT_JSON).
+Brain files: bundled in worker/brain_files/ inside this repo.
+"""
+
+import json
+import os
+import subprocess
+import tempfile
+import time
+from datetime import datetime
+
+import gspread
+import pandas as pd
+import requests
+import streamlit as st
+import vertexai
+from google.cloud import storage
+from google.oauth2 import service_account
+from vertexai.generative_models import GenerativeModel, Part
+
+# =============================================================================
+# CONFIG — confirmed infra, baked in, never shown to the teammate
+# =============================================================================
+PROJECT_ID  = "gtm-5wnb34pj"
+REGION      = "asia-south1"
+BUCKET_NAME = "metago-qa-oudits"
+SHEET_ID    = "1r8dMXKllejmvaVcy-4whH_fX-7lZ2hD6Mf5PtYVRJNQ"
+MODEL_NAME  = "gemini-2.5-flash"
+SHEET_URL   = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}"
+MIN_DURATION_SEC = 90
+
+BRAIN_DIR     = os.path.join(os.path.dirname(__file__), "worker", "brain_files")
+LEGEND_FILE   = os.path.join(BRAIN_DIR, "legend.csv")
+OBJ_FILE      = os.path.join(BRAIN_DIR, "objections.txt")
+SCRIPT_FILE   = os.path.join(BRAIN_DIR, "agent_script.csv")
+FOLLOWUP_FILE = os.path.join(BRAIN_DIR, "follow_up.csv")
+BEHAVIOR_FILE = os.path.join(BRAIN_DIR, "behavior.txt")
+
+st.set_page_config(page_title="MetaGoHealth QA Engine", page_icon="🎧", layout="wide")
+
+# =============================================================================
+# BRAIN FILE LOADING
+# =============================================================================
+
+def read_text_robust(path):
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            with open(path, "r", encoding=enc) as f:
+                return f.read()
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not decode {path} with any known encoding.")
+
+
+def read_csv_robust(path):
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            return pd.read_csv(path, encoding=enc)
+        except UnicodeDecodeError:
+            continue
+    raise ValueError(f"Could not decode {path} with any known encoding.")
+
+
+@st.cache_resource(show_spinner=False)
+def load_brain():
+    legend_df = read_csv_robust(LEGEND_FILE)
+    obj_text = read_text_robust(OBJ_FILE)
+    behavior_text = read_text_robust(BEHAVIOR_FILE)
+
+    script_df = read_csv_robust(SCRIPT_FILE)
+    script_text = "\n".join(script_df.iloc[:, 0].dropna().astype(str).tolist())
+
+    followup_df = read_csv_robust(FOLLOWUP_FILE)
+    followup_lines = followup_df.iloc[:, 0].dropna().astype(str).tolist()
+    followup_text = "\n".join(f"- {line}" for line in followup_lines)
+
+    label_cols = ["A", "B", "C", "D", "E"]
+    blocks = []
+    output_cols = []  # list of (label_col, reason_col)
+
+    for _, row in legend_df.iterrows():
+        pid = str(row["Parameter_ID"]).strip()
+        name = str(row["Parameter_Name"]).strip()
+        scoring_type = str(row["Scoring_Type"]).strip()
+        desc = str(row["Description"]).strip()
+        na_when = row.get("Score_NA_When")
+        out_col = str(row["Output_Column_Name"]).strip()
+        out_reason_col = str(row["Output_Reason_Column_Name"]).strip()
+
+        label_lines = []
+        for L in label_cols:
+            lab = row.get(f"Label_{L}")
+            cond = row.get(f"Label_{L}_When")
+            if pd.notna(lab) and str(lab).strip() and str(lab).strip().upper() != "NA":
+                label_lines.append(f"    * {str(lab).strip()} -> {str(cond).strip()}")
+
+        block = f"[{pid}] {name} | Type: {scoring_type}\n  {desc}\n" + "\n".join(label_lines)
+        if pd.notna(na_when) and str(na_when).strip() and str(na_when).strip().upper() != "NA":
+            block += f"\n    Mark NA when: {str(na_when).strip()}"
+
+        blocks.append(block)
+        output_cols.append((out_col, out_reason_col))
+
+    rubric_text = "\n\n".join(blocks)
+
+    json_lines = []
+    for out_col, out_reason_col in output_cols:
+        json_lines.append(f'  "{out_col}": "<label or numeric score or Pass/Fail or NA>"')
+        json_lines.append(f'  "{out_reason_col}": "<1-2 sentence justification, cite a moment/timestamp if relevant>"')
+    for col, instr in [
+        ("Customer Name", "Extract from transcript or write Unknown."),
+        ("Overall area of opportunity", "2-3 sentence synthesis of the biggest conversion gap on this call."),
+        ("Primary Objection", "Main reason the customer hesitated, or None if converted."),
+        ("Reason for Non-Conversion", "Why the call did not convert, or Converted if it did."),
+        ("Coaching Tip", "One specific tip referencing the exact low-scoring parameter ID and moment it failed."),
+    ]:
+        json_lines.append(f'  "{col}": "{instr}"')
+
+    json_template = "{\n" + ",\n".join(json_lines) + "\n}"
+
+    meta_cols = ["Processed Date", "Call Date", "Agent Name", "Customer Name", "File Name"]
+    computed_cols = ["Call Duration (sec)", "Call Duration Flag", "Conversion Outcome"]
+    coaching_cols = ["Overall area of opportunity", "Primary Objection",
+                      "Reason for Non-Conversion", "Coaching Tip", "Full Transcript"]
+    dynamic_cols = []
+    for out_col, out_reason_col in output_cols:
+        dynamic_cols.append(out_col)
+        dynamic_cols.append(out_reason_col)
+
+    final_cols = meta_cols + computed_cols + dynamic_cols + coaching_cols
+
+    return {
+        "rubric_text": rubric_text,
+        "obj_text": obj_text,
+        "script_text": script_text,
+        "followup_text": followup_text,
+        "behavior_text": behavior_text,
+        "json_template": json_template,
+        "final_cols": final_cols,
+    }
+
+
+# =============================================================================
+# GCP CLIENTS
+# =============================================================================
+
+@st.cache_resource(show_spinner=False)
+def get_clients():
+    key_dict = json.loads(st.secrets["GCP_SERVICE_ACCOUNT_JSON"])
+    scopes = [
+        "https://www.googleapis.com/auth/cloud-platform",
+        "https://www.googleapis.com/auth/spreadsheets",
+    ]
+    creds = service_account.Credentials.from_service_account_info(key_dict, scopes=scopes)
+    gcs_client = storage.Client(credentials=creds, project=PROJECT_ID)
+    vertexai.init(project=PROJECT_ID, location=REGION, credentials=creds)
+    ai_model = GenerativeModel(MODEL_NAME)
+    bucket = gcs_client.bucket(BUCKET_NAME)
+    gc = gspread.authorize(creds)
+    worksheet = gc.open_by_key(SHEET_ID).sheet1
+    return ai_model, bucket, worksheet
+
+
+def get_existing_filenames(worksheet, final_cols):
+    """Read the sheet once to dedupe against File Name column."""
+    try:
+        records = worksheet.get_all_records(expected_headers=final_cols)
+        return {r.get("File Name", "") for r in records if r.get("File Name")}
+    except Exception:
+        return set()
+
+
+def ensure_headers(worksheet, final_cols):
+    first_row = worksheet.row_values(1)
+    if first_row != final_cols:
+        worksheet.clear()
+        worksheet.append_row(final_cols, value_input_option="USER_ENTERED")
+
+
+# =============================================================================
+# CALL PROCESSING HELPERS
+# =============================================================================
+
+def download_mp3(url, dest_path):
+    headers = {"User-Agent": "Mozilla/5.0", "Accept": "audio/mpeg,*/*;q=0.8"}
+    for attempt in range(3):
+        try:
+            r = requests.get(url, stream=True, headers=headers, timeout=30)
+            r.raise_for_status()
+            with open(dest_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=8192):
+                    f.write(chunk)
+            return True
+        except Exception:
+            time.sleep(3)
+    return False
+
+
+def get_duration_seconds(path):
+    try:
+        out = subprocess.run(
+            ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+             "-of", "default=noprint_wrappers=1:nokey=1", path],
+            capture_output=True, text=True, timeout=20,
+        )
+        return float(out.stdout.strip())
+    except Exception:
+        return None
+
+
+def upload_to_gcs(bucket, local_path, blob_name):
+    blob = bucket.blob(blob_name)
+    blob.upload_from_filename(local_path)
+    return blob
+
+
+def get_transcript(ai_model, audio_bytes, mime_type="audio/mpeg"):
+    prompt = (
+        "Transcribe this call verbatim, in the original language mix (English/Hindi/Marathi as spoken). "
+        "Label each turn as Agent: or Customer:. Include approximate timestamps in [MM:SS] format "
+        "at the start of each turn if you can infer them from pacing. Do not summarize or translate."
+    )
+    part = Part.from_data(data=audio_bytes, mime_type=mime_type)
+    response = ai_model.generate_content([prompt, part])
+    return response.text.strip()
+
+
+def score_call(ai_model, transcript, brain, agent_name, call_date, file_name, duration_sec):
+    system_prompt = f"""You are an expert QA auditor for MetaGoHealth's sales calls (GLP-1 weight management program, 1799/1000 assessment fee).
+
+--- SCORING RUBRIC ---
+{brain['rubric_text']}
+
+--- OBJECTION HANDLING REFERENCE (correct answers) ---
+{brain['obj_text']}
+
+--- APPROVED AGENT SCRIPT (reference for expected structure) ---
+{brain['script_text']}
+
+--- FOLLOW-UP CALL DETECTION ---
+If the transcript matches a follow-up scenario, rate ONLY communication-related parameters normally;
+mark all other parameters NA. Follow-up indicator phrases:
+{brain['followup_text']}
+
+--- BEHAVIOR & PROFESSIONALISM GUIDELINES ---
+{brain['behavior_text']}
+
+--- CALL METADATA ---
+Agent Name: {agent_name}
+Call Date: {call_date}
+File Name: {file_name}
+Call Duration: {duration_sec:.0f} seconds
+
+--- TRANSCRIPT ---
+{transcript}
+
+--- INSTRUCTIONS ---
+Score every parameter in the rubric above using the exact Output_Column_Name and Output_Reason_Column_Name keys.
+Respect every "Mark NA when" condition and every cross-parameter dependency stated in the rubric
+(e.g. some parameters are only scored if a specific customer signal was present in another parameter).
+Respond ONLY with a single valid JSON object, no markdown fences, no preamble, matching this exact shape:
+
+{brain['json_template']}
+"""
+    response = ai_model.generate_content(system_prompt)
+    text = response.text.strip()
+    if text.startswith("```"):
+        text = text.strip("`")
+        if text.startswith("json"):
+            text = text[4:]
+    return json.loads(text.strip())
+
+
+# =============================================================================
+# MAIN PROCESSING LOOP
+# =============================================================================
+
+def process_calls(df, url_col, agent_col, date_col, brain, ai_model, bucket, worksheet,
+                   final_cols, status_box, progress_bar):
+    existing = get_existing_filenames(worksheet, final_cols)
+    counts = {"success": 0, "skipped": 0, "excluded": 0, "failed": 0}
+    total = len(df)
+
+    for i, row in df.iterrows():
+        url = str(row[url_col]).strip()
+        agent_name = str(row[agent_col]).strip() if agent_col else "Unknown"
+        call_date = str(row[date_col]).strip() if date_col else ""
+        file_name = url.split("/")[-1].split("?")[0] or f"call_{i}.mp3"
+
+        progress_bar.progress((i + 1) / total)
+        status_box.write(f"**[{i+1}/{total}]** `{file_name}` — starting")
+
+        if file_name in existing:
+            counts["skipped"] += 1
+            status_box.write(f"**[{i+1}/{total}]** `{file_name}` — already scored, skipped")
+            continue
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            local_path = os.path.join(tmpdir, file_name)
+            if not download_mp3(url, local_path):
+                counts["failed"] += 1
+                status_box.write(f"**[{i+1}/{total}]** `{file_name}` — download failed")
+                continue
+
+            duration = get_duration_seconds(local_path)
+            if duration is None:
+                counts["failed"] += 1
+                status_box.write(f"**[{i+1}/{total}]** `{file_name}` — could not read duration, failed")
+                continue
+
+            if duration < MIN_DURATION_SEC:
+                counts["excluded"] += 1
+                status_box.write(f"**[{i+1}/{total}]** `{file_name}` — excluded ({duration:.0f}s < 90s)")
+                continue
+
+            try:
+                upload_to_gcs(bucket, local_path, f"processed/{file_name}")
+
+                with open(local_path, "rb") as f:
+                    audio_bytes = f.read()
+
+                transcript = get_transcript(ai_model, audio_bytes)
+                scored = score_call(ai_model, transcript, brain, agent_name, call_date,
+                                     file_name, duration)
+
+                row_out = {
+                    "Processed Date": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "Call Date": call_date,
+                    "Agent Name": agent_name,
+                    "Customer Name": scored.get("Customer Name", "Unknown"),
+                    "File Name": file_name,
+                    "Call Duration (sec)": round(duration),
+                    "Call Duration Flag": "Short" if duration < 180 else "Normal",
+                    "Conversion Outcome": scored.get("Reason for Non-Conversion", ""),
+                    "Overall area of opportunity": scored.get("Overall area of opportunity", ""),
+                    "Primary Objection": scored.get("Primary Objection", ""),
+                    "Reason for Non-Conversion": scored.get("Reason for Non-Conversion", ""),
+                    "Coaching Tip": scored.get("Coaching Tip", ""),
+                    "Full Transcript": transcript,
+                }
+                for col in final_cols:
+                    if col not in row_out:
+                        row_out[col] = scored.get(col, "")
+
+                worksheet.append_row(
+                    [row_out.get(c, "") for c in final_cols],
+                    value_input_option="USER_ENTERED",
+                )
+                counts["success"] += 1
+                status_box.write(f"**[{i+1}/{total}]** `{file_name}` — scored and written")
+
+            except Exception as e:
+                counts["failed"] += 1
+                status_box.write(f"**[{i+1}/{total}]** `{file_name}` — failed: {e}")
+
+    return counts
+
+
+# =============================================================================
+# UI
+# =============================================================================
+
+st.title("🎧 MetaGoHealth QA Engine")
+st.caption("Upload the calls CSV, map the columns, click Run. Results write straight to the Google Sheet.")
+
+uploaded_csv = st.file_uploader("Calls CSV", type=["csv"])
+
+if uploaded_csv:
+    df = read_csv_robust(uploaded_csv) if not isinstance(uploaded_csv, str) else pd.read_csv(uploaded_csv)
+    # re-read properly since uploaded_csv is a file-like object
+    uploaded_csv.seek(0)
+    for enc in ("utf-8", "cp1252", "latin-1"):
+        try:
+            uploaded_csv.seek(0)
+            df = pd.read_csv(uploaded_csv, encoding=enc)
+            break
+        except UnicodeDecodeError:
+            continue
+
+    st.write(f"**{len(df)} rows found.** Preview:")
+    st.dataframe(df.head(5), use_container_width=True)
+
+    cols = df.columns.tolist()
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        url_col = st.selectbox("Recording URL column", cols,
+                                index=next((i for i, c in enumerate(cols) if "url" in c.lower() or "link" in c.lower()), 0))
+    with c2:
+        agent_col = st.selectbox("Agent name column", ["(none)"] + cols,
+                                  index=next((i + 1 for i, c in enumerate(cols) if "agent" in c.lower()), 0))
+    with c3:
+        date_col = st.selectbox("Call date column", ["(none)"] + cols,
+                                 index=next((i + 1 for i, c in enumerate(cols) if "date" in c.lower()), 0))
+
+    agent_col = None if agent_col == "(none)" else agent_col
+    date_col = None if date_col == "(none)" else date_col
+
+    if st.button("▶️ Run Audit", type="primary"):
+        brain = load_brain()
+        ai_model, bucket, worksheet = get_clients()
+        ensure_headers(worksheet, brain["final_cols"])
+
+        status_box = st.container(height=300)
+        progress_bar = st.progress(0)
+
+        counts = process_calls(df, url_col, agent_col, date_col, brain, ai_model, bucket,
+                                worksheet, brain["final_cols"], status_box, progress_bar)
+
+        st.success(
+            f"Done. {counts['success']} scored, {counts['skipped']} skipped (already done), "
+            f"{counts['excluded']} excluded (<90s), {counts['failed']} failed."
+        )
+        st.markdown(f"[Open Google Sheet]({SHEET_URL})")
+else:
+    st.info("Upload a CSV containing at least a recording URL column to begin.")
