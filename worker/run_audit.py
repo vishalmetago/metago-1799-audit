@@ -41,6 +41,7 @@ PROJECT_ID  = "gtm-5wnb34pj"
 REGION      = "asia-south1"
 BUCKET_NAME = "metago-qa-oudits"
 SHEET_ID    = "1r8dMXKllejmvaVcy-4whH_fX-7lZ2hD6Mf5PtYVRJNQ"
+SHEET_TAB_NAME = "Output"
 MODEL_NAME  = "gemini-2.5-flash"
 MIN_DURATION_SEC = 90
 
@@ -181,7 +182,8 @@ def get_clients():
     bucket = gcs_client.bucket(BUCKET_NAME)
 
     gc = gspread.authorize(creds)
-    worksheet = gc.open_by_key(SHEET_ID).sheet1
+    worksheet = gc.open_by_key(SHEET_ID).worksheet(SHEET_TAB_NAME)
+    log(f"Connected to Sheet tab: '{worksheet.title}'")
 
     drive_service = build("drive", "v3", credentials=creds)
 
@@ -241,13 +243,15 @@ def download_drive_file(drive_service, file_id):
 
 
 def move_to_processed(drive_service, file_id):
-    drive_service.files().update(
-        fileId=file_id,
-        addParents=DRIVE_PROCESSED_FOLDER_ID,
-        removeParents=DRIVE_INBOX_FOLDER_ID,
-        fields="id, parents",
-        supportsAllDrives=True,
-    ).execute()
+    call_with_backoff(
+        drive_service.files().update(
+            fileId=file_id,
+            addParents=DRIVE_PROCESSED_FOLDER_ID,
+            removeParents=DRIVE_INBOX_FOLDER_ID,
+            fields="id, parents",
+            supportsAllDrives=True,
+        ).execute
+    )
 
 
 # =============================================================================
@@ -306,7 +310,11 @@ def call_with_backoff(func, *args, max_attempts=5, **kwargs):
             return func(*args, **kwargs)
         except Exception as e:
             msg = str(e).lower()
-            transient = any(k in msg for k in ["429", "rate", "resourceexhausted", "quota", "503", "unavailable"])
+            transient = any(k in msg for k in [
+                "429", "rate", "resourceexhausted", "quota", "503", "unavailable",
+                "eof occurred", "connection reset", "connection aborted",
+                "broken pipe", "ssl", "timed out",
+            ])
             if not transient or attempt == max_attempts - 1:
                 raise
             log(f"  transient error, retrying in {delay}s: {e}")
@@ -488,17 +496,22 @@ def main():
             log(f"  Could not read {f['name']}: {e}. Leaving it in the inbox for review.")
             continue
 
-        counts = process_csv(df, brain, ai_model, bucket, worksheet, brain["final_cols"])
-        if counts is None:
+        try:
+            counts = process_csv(df, brain, ai_model, bucket, worksheet, brain["final_cols"])
+            if counts is None:
+                continue
+
+            log(
+                f"  Done with {f['name']}: {counts['success']} scored, {counts['skipped']} skipped, "
+                f"{counts['excluded']} excluded, {counts['failed']} failed."
+            )
+
+            move_to_processed(drive_service, f["id"])
+            log(f"  Moved {f['name']} to processed/")
+        except Exception as e:
+            log(f"  Error finishing up {f['name']}: {e}. It will be retried next run "
+                f"(already-scored rows are safely deduped, so nothing is lost).")
             continue
-
-        log(
-            f"  Done with {f['name']}: {counts['success']} scored, {counts['skipped']} skipped, "
-            f"{counts['excluded']} excluded, {counts['failed']} failed."
-        )
-
-        move_to_processed(drive_service, f["id"])
-        log(f"  Moved {f['name']} to processed/")
 
     log("Audit run complete.")
 
