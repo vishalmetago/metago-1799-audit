@@ -1,0 +1,32 @@
+name: 1799 QA Audit (Drive Inbox)
+
+on:
+  schedule:
+    # Runs every 4 hours, UTC. That's roughly 5:30, 9:30, 13:30, 17:30, 21:30, 1:30 IST.
+    - cron: '0 */4 * * *'
+  workflow_dispatch: {}   # lets you trigger it manually from the Actions tab too
+
+jobs:
+  audit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 355   # same ceiling as the DC_QC workflow
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install ffmpeg
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+
+      - name: Install Python dependencies
+        run: pip install -r worker/requirements-actions.txt
+
+      - name: Run audit
+        env:
+          GCP_SERVICE_ACCOUNT_JSON: ${{ secrets.GCP_SA_KEY }}
+        run: python worker/run_audit.py
