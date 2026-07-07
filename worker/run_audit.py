@@ -208,20 +208,30 @@ def ensure_headers(worksheet, final_cols):
 # =============================================================================
 
 def list_inbox_csvs(drive_service):
-    """CSVs sitting directly in the inbox folder (not the processed subfolder)."""
+    """CSVs sitting directly in the inbox folder (not the processed subfolder).
+
+    supportsAllDrives / includeItemsFromAllDrives are required because
+    1799-Audit-Inbox lives inside a Shared Drive, not My Drive. Without
+    these, the API silently returns zero results with no error.
+    """
     query = (
         f"'{DRIVE_INBOX_FOLDER_ID}' in parents "
         "and trashed = false "
         "and (mimeType = 'text/csv' or name contains '.csv')"
     )
     results = drive_service.files().list(
-        q=query, fields="files(id, name)", pageSize=100
+        q=query,
+        fields="files(id, name)",
+        pageSize=100,
+        supportsAllDrives=True,
+        includeItemsFromAllDrives=True,
+        corpora="allDrives",
     ).execute()
     return results.get("files", [])
 
 
 def download_drive_file(drive_service, file_id):
-    request = drive_service.files().get_media(fileId=file_id)
+    request = drive_service.files().get_media(fileId=file_id, supportsAllDrives=True)
     buf = io.BytesIO()
     downloader = MediaIoBaseDownload(buf, request)
     done = False
@@ -237,6 +247,7 @@ def move_to_processed(drive_service, file_id):
         addParents=DRIVE_PROCESSED_FOLDER_ID,
         removeParents=DRIVE_INBOX_FOLDER_ID,
         fields="id, parents",
+        supportsAllDrives=True,
     ).execute()
 
 
