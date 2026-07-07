@@ -225,7 +225,6 @@ def list_inbox_csvs(drive_service):
         pageSize=100,
         supportsAllDrives=True,
         includeItemsFromAllDrives=True,
-        corpora="allDrives",
     ).execute()
     return results.get("files", [])
 
@@ -469,7 +468,13 @@ def main():
 
     csv_files = list_inbox_csvs(drive_service)
     if not csv_files:
-        log("No CSVs found in the inbox folder. Nothing to do.")
+        try:
+            folder = drive_service.files().get(
+                fileId=DRIVE_INBOX_FOLDER_ID, supportsAllDrives=True, fields="name"
+            ).execute()
+            log(f"No CSVs found in inbox folder '{folder.get('name')}'. Nothing to do.")
+        except Exception as e:
+            log(f"No CSVs found, and could not even confirm folder access: {e}")
         return
 
     log(f"Found {len(csv_files)} CSV(s) in the inbox.")
